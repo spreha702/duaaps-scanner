@@ -1,4 +1,3 @@
-
 name: Build DUAAPS Scanner APK
 
 on:
@@ -27,22 +26,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      - name: Extract project ZIP
-        run: |
-          unzip -o duaaps-scanner-android-capacitor-project.zip -d .
-          rm -f duaaps-scanner-android-capacitor-project.zip
+          cache: npm
 
       - name: Install dependencies
         run: |
-          npm install
+          npm ci
           npm install --no-save typescript@5.9.3
 
-      - name: Generate Android project
-        run: |
-          rm -rf android
-          npx cap add android
-          npx cap sync android
+      - name: Sync web assets and plugins into the existing android project
+        run: npx cap sync android
 
       - name: Build debug APK
         working-directory: android
