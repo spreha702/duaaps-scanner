@@ -1,0 +1,20 @@
+{
+  "name": "duaaps-scanner",
+  "version": "1.0.0",
+  "description": "High performance native Android QR scanner with ML Kit and Capacitor for DUAAPS events",
+  "scripts": {
+    "build": "echo \"Web assets ready in www\"",
+    "cap:sync": "npx cap sync android",
+    "cap:open": "npx cap open android",
+    "cap:run": "npx cap run android",
+    "build:apk": "npx cap sync android && cd android && ./gradlew assembleDebug && cd .."
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.1.2",
+    "@capacitor/android": "^6.1.2",
+    "@capacitor-mlkit/barcode-scanning": "^6.1.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.2"
+  }
+}
