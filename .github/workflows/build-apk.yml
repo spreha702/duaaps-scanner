@@ -26,11 +26,23 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
+
+      - name: Verify project files
+        run: |
+          for f in package.json capacitor.config.ts www/index.html android/gradlew android/gradle/wrapper/gradle-wrapper.jar android/app/src/main/AndroidManifest.xml; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing $f. Commit the full contents of duaaps-scanner-fixed.zip to the repo root."
+              exit 1
+            fi
+          done
+          grep -q "android.permission.CAMERA" android/app/src/main/AndroidManifest.xml || {
+            echo "::error::CAMERA permission missing from AndroidManifest.xml"
+            exit 1
+          }
 
       - name: Install dependencies
         run: |
-          npm ci
+          npm install
           npm install --no-save typescript@5.9.3
 
       - name: Sync web assets and plugins into the existing android project
