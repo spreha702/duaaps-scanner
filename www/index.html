@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#0b2447">
+  <title>DUAAPS Scanner</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="scanner-page">
+  <!-- Native camera preview will shine through #stage or transparent body -->
+  <div id="stage"></div>
+
+  <!-- Reticle Framing Box with Glowing Corners -->
+  <div class="overlay">
+    <div class="frame" id="frame">
+      <span class="corner tl"></span>
+      <span class="corner tr"></span>
+      <span class="corner bl"></span>
+      <span class="corner br"></span>
+      <div class="laser-line"></div>
+    </div>
+  </div>
+
+  <!-- Top App Bar -->
+  <header class="app-bar">
+    <div class="event-meta">
+      <span class="badge-tag">SCANNING FOR</span>
+      <h1 class="event-title" id="evName">DUAAPS REUNION</h1>
+    </div>
+    <div class="action-buttons">
+      <!-- Turbo Mode Toggle -->
+      <button class="pill-btn turbo-btn" id="turboBtn" title="Toggle Turbo High-Speed Mode">
+        ⚡ TURBO: <span id="turboStatus">ON</span>
+      </button>
+      <!-- Torch Button -->
+      <button class="icon-btn" id="torchBtn" title="Toggle Flashlight" aria-label="Toggle Torch">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+        </svg>
+      </button>
+      <button class="pill-btn" id="changeBtn">PIN</button>
+    </div>
+  </header>
+
+  <!-- Live Status & Helper Chip -->
+  <div class="hint-pill" id="camMsg">Point camera at QR code</div>
+  <button class="chip-btn" id="manualBtn">Type ID</button>
+
+  <!-- Sliding Result Sheet -->
+  <div id="result" class="result-sheet">
+    <div class="sheet-handle"></div>
+    <div id="resultContent"></div>
+  </div>
+
+  <!-- Camera Permission Denied Dialog with Direct Android Settings Access -->
+  <div id="permModal" class="modal-backdrop" style="display:none">
+    <div class="modal-card">
+      <div class="logo-circle" style="background:#e11d48">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2">
+          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+          <line x1="1" y1="1" x2="23" y2="23"/>
+        </svg>
+      </div>
+      <h2>Camera Permission Required</h2>
+      <p class="subtitle" id="permSubtitle">
+        DUAAPS Scanner requires camera access to scan attendee QR codes.
+      </p>
+      
+      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin-bottom:14px;text-align:left;font-size:12.5px;color:#334155;line-height:1.5">
+        <div style="font-weight:700;color:#0b2447;margin-bottom:4px">On Android 13, 14, and 15:</div>
+        If previously denied, tap <b>Open App Settings</b> below, then select <b>Permissions ➔ Camera ➔ Allow only while using the app</b>.
+      </div>
+
+      <button id="openSettingsBtn" class="primary-btn" style="background:#e11d48">⚙️ Open App Settings (Enable Camera)</button>
+      <button id="grantPermBtn" class="secondary-btn" style="margin-top:8px">🔄 Try Requesting Permission Again</button>
+      <button id="closePermBtn" class="secondary-btn" style="margin-top:8px;background:transparent;color:#94a3b8">Dismiss</button>
+    </div>
+  </div>
+
+  <!-- PIN Unlock Modal -->
+  <div id="login" class="modal-backdrop">
+    <div class="modal-card">
+      <div class="logo-circle">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#f2b84b" stroke-width="2">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+      </div>
+      <h2>DUAAPS Scanner</h2>
+      <p class="subtitle">Enter Event PIN to unlock. (Saved automatically for future launches)</p>
+      <input id="pin" type="password" inputmode="numeric" placeholder="••••" maxlength="6" autocomplete="off">
+      <button id="loginBtn" class="primary-btn">Unlock Scanner</button>
+      <div class="login-msg" id="loginMsg"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
