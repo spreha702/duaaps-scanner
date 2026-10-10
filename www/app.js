@@ -1,7 +1,6 @@
 /**
- * DUAAPS Scanner Native App Logic
- * Ultra-fast verification (<50ms local check), instant startup camera permission,
- * and seamless fallback between Capacitor ML Kit and browser engines.
+ * DUAAPS Scanner Native App Logic (v1.1)
+ * Offline-first: local copy of the registration list, instant decisions, background sync.
  */
 
 const WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbzc_G9p-gwpPuC08389OjgPq3HkL3rKOJQ7LDc3rUPQZUsrWZhm_14VYVUdHJYCBeqJ/exec';
@@ -14,9 +13,6 @@ let lastScanTime = 0;
 let torchEnabled = false;
 let isNative = false;
 let turboMode = true; // High-speed gate mode: 0.8s auto-reset
-
-// In-Memory Fast Cache for 0ms Duplicate Check
-const localScanCache = new Map();
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -156,6 +152,7 @@ async function startCameraInner() {
       setScannerTransparent(true);
       await BarcodeScanner.startScan({ formats: ['QR_CODE'], lensFacing: 'BACK' });
       nativeScanning = true;
+      initZoom();
       $('camMsg').textContent = 'Point at a QR code';
       return;
     } catch (nativeErr) {
@@ -325,212 +322,578 @@ function handleScanned(rawText) {
   submitScan(val);
 }
 
-// ULTRA-FAST VERIFICATION ENGINE
-async function submitScan(rawText) {
-  if (isBusy || !PIN) return;
-  isBusy = true;
 
-  const id = extractId(rawText);
+/* =====================================================================================
+ * OFFLINE-FIRST ENGINE (v1.1)
+ *  - On login the phone downloads every registration + who already entered / got food.
+ *  - Every scan is decided from that local copy (instant), saved locally, queued, and sent to the
+ *    server in the background. The server stays the single source of truth.
+ *  - Every few seconds the phone asks the server "what changed?" so scans made on other phones
+ *    appear here almost in real time.
+ * ===================================================================================== */
+const POLL_ACTIVE = 4000;               // while scanning
+const POLL_IDLE = 12000;
+const SNAPSHOT_REFRESH = 10 * 60 * 1000; // silent full refresh (safety net)
 
-  // 1. INSTANT LOCAL CACHE CHECK (<1ms): Did this ticket already enter today?
-  if (localScanCache.has(id.toLowerCase())) {
-    const cachedTime = localScanCache.get(id.toLowerCase());
-    renderResult({
-      status: 'DUPLICATE',
-      headline: 'ALREADY SCANNED',
-      event: 'ENTRY GATE',
-      time: cachedTime,
-      message: 'Already admitted today at ' + cachedTime + ' (Instant local detection)'
+let ROLE = '';      // 'gate' | 'event'
+let LABEL = '';     // e.g. "Breakfast"
+let evNorm = '';    // normalised event name used as the key in the local records
+
+const people = new Map();   // k (lower-case id) -> person
+const marks = new Map();    // k -> { k, entry: 'time' | '', ev: { eventNorm: 'time' } }
+let outbox = [];            // scans waiting for the server
+let meta = { seq: 0, events: [], snapshotAt: 0, tzMin: null, tzEvMin: null, deviceId: '', okHeadline: {}, conflicts: [], lastContact: 0 };
+
+const norm = s => String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, '');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const newCid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+/* ---------- tiny IndexedDB wrapper (all calls resolve, never throw) ---------- */
+const Store = {
+  db: null,
+  open() {
+    return new Promise(resolve => {
+      try {
+        if (!window.indexedDB) return resolve(false);
+        const rq = indexedDB.open('duaaps-scanner', 1);
+        rq.onupgradeneeded = () => {
+          const d = rq.result;
+          d.createObjectStore('people', { keyPath: 'k' });
+          d.createObjectStore('marks', { keyPath: 'k' });
+          d.createObjectStore('photos', { keyPath: 'fid' });
+          d.createObjectStore('outbox', { keyPath: 'cid' });
+          d.createObjectStore('kv', { keyPath: 'key' });
+        };
+        rq.onsuccess = () => { Store.db = rq.result; resolve(true); };
+        rq.onerror = () => resolve(false);
+      } catch (e) { resolve(false); }
     });
-    isBusy = false;
-    return;
-  }
+  },
+  _run(store, mode, fn) {
+    return new Promise(resolve => {
+      if (!Store.db) return resolve(undefined);
+      try {
+        const tx = Store.db.transaction(store, mode);
+        const req = fn(tx.objectStore(store));
+        tx.oncomplete = () => resolve(req ? req.result : undefined);
+        tx.onerror = tx.onabort = () => resolve(undefined);
+      } catch (e) { resolve(undefined); }
+    });
+  },
+  get(store, key) { return Store._run(store, 'readonly', os => os.get(key)); },
+  all(store) { return Store._run(store, 'readonly', os => os.getAll()); },
+  keys(store) { return Store._run(store, 'readonly', os => os.getAllKeys()); },
+  put(store, val) { return Store._run(store, 'readwrite', os => { os.put(val); return null; }); },
+  putMany(store, arr) { return Store._run(store, 'readwrite', os => { arr.forEach(v => os.put(v)); return null; }); },
+  del(store, key) { return Store._run(store, 'readwrite', os => { os.delete(key); return null; }); },
+  clear(store) { return Store._run(store, 'readwrite', os => { os.clear(); return null; }); }
+};
 
-  // 2. Snappy Optimistic UI
-  const sheet = $('result');
-  const content = $('resultContent');
-  content.innerHTML = '<div style="text-align:center;padding:22px;color:#64748b;font-weight:700">⚡ Verifying ID: ' + esc(id) + '…</div>';
-  sheet.classList.add('show');
+function saveMeta() { Store.put('kv', { key: 'meta', value: meta }); }
 
-  // 3. High-Speed API Call with Fast Timeout & Keepalive
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 6000); // 6s network timeout
+async function loadLocal() {
+  await Store.open();
+  const m = await Store.get('kv', 'meta');
+  if (m && m.value) meta = Object.assign(meta, m.value);
+  if (!meta.deviceId) { meta.deviceId = Math.random().toString(36).slice(2, 8); saveMeta(); }
+  (await Store.all('people') || []).forEach(p => people.set(p.k, p));
+  (await Store.all('marks') || []).forEach(m2 => marks.set(m2.k, m2));
+  outbox = ((await Store.all('outbox')) || []).sort((a, b) => a.ts - b.ts);
+}
 
+/* ---------- time (formatted like the sheet: 10-Oct-2026 02:15:30 PM, in the server's time zone) ---------- */
+function tzMin() { return meta.tzMin != null ? meta.tzMin : -new Date().getTimezoneOffset(); }
+function fmtTime(ts) {
+  const d = new Date((ts || Date.now()) + tzMin() * 60000);
+  const p = n => String(n).padStart(2, '0');
+  const M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  let h = d.getUTCHours(); const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12;
+  return p(d.getUTCDate()) + '-' + M[d.getUTCMonth()] + '-' + d.getUTCFullYear() + ' ' + p(h) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) + ' ' + ap;
+}
+/** Event times are written by EventScanner.gs as "10 Oct 2026, 02:15:30 PM" (Asia/Dhaka). */
+function fmtEvTime(ts) {
+  const off = meta.tzEvMin != null ? meta.tzEvMin : tzMin();
+  const d = new Date((ts || Date.now()) + off * 60000);
+  const p = n => String(n).padStart(2, '0');
+  const M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  let h = d.getUTCHours(); const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12;
+  return p(d.getUTCDate()) + ' ' + M[d.getUTCMonth()] + ' ' + d.getUTCFullYear() + ', ' + p(h) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) + ' ' + ap;
+}
+function applyTz(d) {
+  const a = parseTz(d && d.tz), b = parseTz(d && d.tzEv);
+  if (a !== null) meta.tzMin = a;
+  if (b !== null) meta.tzEvMin = b;
+  saveMeta();
+}
+function parseTz(z) {
+  const m = /^([+-])(\d{2})(\d{2})$/.exec(String(z || ''));
+  return m ? (m[1] === '-' ? -1 : 1) * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10)) : null;
+}
+
+/* ---------- local records ---------- */
+const peekMark = k => marks.get(k);
+function getMark(k) { let m = marks.get(k); if (!m) { m = { k, entry: '', ev: {} }; marks.set(k, m); } return m; }
+function setEntry(k, t) { const m = getMark(k); m.entry = t || ''; Store.put('marks', m); }
+function setEvent(k, en, t) { if (!en) return; const m = getMark(k); if (t) m.ev[en] = t; else delete m.ev[en]; Store.put('marks', m); }
+function savePerson(p) { Store.put('people', p); }
+function rowToPerson(r) {
+  return { k: String(r[0]).toLowerCase(), id: String(r[0]), name: r[1] || '', degree: r[2] || '', session: r[3] || '',
+    attendees: r[4] || '', guestType: r[5] || '', totalFee: r[6] || '', bloodGroup: r[7] || '', fid: r[8] || '', pv: r[9] ? 1 : 0 };
+}
+function resolveEv(n) {
+  if (!n) return '';
+  const hit = meta.events.find(e => e.norm === n) || meta.events.find(e => e.norm.indexOf(n) >= 0 || n.indexOf(e.norm) >= 0);
+  return hit ? hit.norm : n;
+}
+function applyRecord(k, record) {
+  (record || []).forEach(x => { if (x && x.time) setEvent(k, resolveEv(norm(x.label)), String(x.time)); });
+}
+function hasPending(k, kind, en) {
+  return outbox.some(x => x.k === k && x.kind === kind && (kind === 'ENTRY' || x.en === en));
+}
+function learnEvent(label) {
+  if (ROLE !== 'event' || !label) return;
+  const n = resolveEv(norm(label));
+  if (n && n !== evNorm) { evNorm = n; try { localStorage.setItem('duaaps_evnorm', evNorm); } catch (e) {} }
+  if (!LABEL) { LABEL = String(label); }
+}
+
+/* ---------- network ---------- */
+let netOk = true;
+function setNet(ok) { netOk = ok; if (ok) { meta.lastContact = Date.now(); } updateChip(); }
+
+async function api(action, body, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 15000);
   try {
     const res = await fetch(WEBAPP_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ action: 'scan', pin: PIN, id: id }),
-      signal: controller.signal,
-      keepalive: true
+      body: JSON.stringify(Object.assign({ action }, body)),
+      signal: ctrl.signal
     });
-    clearTimeout(timeoutId);
+    const raw = await res.text();
+    try { return JSON.parse(raw); }
+    catch (e) { const er = new Error('Server returned an unexpected page. Check the Apps Script deployment (Execute as: Me, Access: Anyone).'); er.name = 'BadResponse'; throw er; }
+  } finally { clearTimeout(timer); }
+}
 
-    const data = await res.json();
-
-    // Cache successful scans locally to make subsequent duplicate lookups 0ms instant!
-    if (data.status === 'OK') {
-      const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      localScanCache.set(id.toLowerCase(), nowStr);
+/* ---------- snapshot (download everything) ---------- */
+let snapBusy = false;
+async function downloadSnapshot(showProgress, pinArg) {
+  if (snapBusy) return;
+  snapBusy = true;
+  const pin = pinArg || PIN;
+  try {
+    let from = 2, first = null; const rows = [];
+    while (from) {
+      const d = await api('app_snapshot', { pin, from, dev: meta.deviceId }, 60000);
+      if (d.bad_pin) throw new Error(d.message || 'Wrong PIN');
+      if (!d.ok) throw new Error(d.message || 'Download failed');
+      if (!first) first = d;
+      d.rows.forEach(r => rows.push(r));
+      if (showProgress) $('loginMsg').textContent = 'Downloading registrations… ' + rows.length + (d.total ? ' / ' + d.total : '');
+      from = d.next || 0;
     }
-
-    renderResult(data);
-  } catch (err) {
-    clearTimeout(timeoutId);
-    renderResult({
-      status: 'ERROR',
-      message: err.name === 'AbortError' ? 'Network timeout. Check Wi-Fi/4G connection.' : err.message || String(err)
+    setNet(true);
+    const newPeople = new Map(), newMarks = new Map();
+    rows.forEach(r => {
+      const p = rowToPerson(r); newPeople.set(p.k, p);
+      if (r[10]) newMarks.set(p.k, { k: p.k, entry: String(r[10]), ev: {} });
     });
-  }
-
-  isBusy = false;
+    const sm = first.marks || {};
+    Object.keys(sm).forEach(id => {
+      const k = id.toLowerCase();
+      const m = newMarks.get(k) || { k, entry: '', ev: {} };
+      Object.keys(sm[id]).forEach(lbl => { m.ev[norm(lbl)] = sm[id][lbl]; });
+      newMarks.set(k, m);
+    });
+    // scans still waiting to be sent must survive the refresh
+    outbox.forEach(x => {
+      if (x.local !== 'OK') return;
+      const m = newMarks.get(x.k) || { k: x.k, entry: '', ev: {} };
+      if (x.kind === 'ENTRY') m.entry = m.entry || x.localTime; else if (x.en) m.ev[x.en] = m.ev[x.en] || x.localTime;
+      newMarks.set(x.k, m);
+    });
+    people.clear(); newPeople.forEach((v, k) => people.set(k, v));
+    marks.clear(); newMarks.forEach((v, k) => marks.set(k, v));
+    meta.events = (first.events || []).map(l => ({ label: String(l), norm: norm(l) }));
+    meta.seq = first.seq || 0;
+    meta.snapshotAt = Date.now();
+    if (ROLE === 'event') evNorm = resolveEv(norm(LABEL) || evNorm);
+    saveMeta();
+    await Store.clear('people'); await Store.putMany('people', [...people.values()]);
+    await Store.clear('marks'); await Store.putMany('marks', [...marks.values()]);
+    prefetchPhotos();
+  } finally { snapBusy = false; updateChip(); }
 }
 
-function renderResult(r) {
-  const sheet = $('result');
-  const content = $('resultContent');
+/* ---------- photos (downloaded in the background, cached on the phone) ---------- */
+const photoMem = new Map();
+let photoKeys = new Set(), photoBusy = false, photoTotal = 0;
+const photosWanted = () => { try { return localStorage.getItem('duaaps_photos') !== 'off'; } catch (e) { return true; } };
+async function getPhoto(fid) {
+  if (!fid) return null;
+  if (photoMem.has(fid)) return photoMem.get(fid);
+  const r = await Store.get('photos', fid);
+  if (r && r.data) { rememberPhoto(fid, r.data); return r.data; }
+  return null;
+}
+function rememberPhoto(fid, data) {
+  photoMem.set(fid, data);
+  if (photoMem.size > 40) photoMem.delete(photoMem.keys().next().value);
+}
+async function fetchPhotos(fids) {
+  try {
+    const d = await api('app_photos', { pin: PIN, ids: fids }, 25000);
+    if (d && d.ok && d.photos) {
+      for (const fid of Object.keys(d.photos)) {
+        rememberPhoto(fid, d.photos[fid]); photoKeys.add(fid);
+        Store.put('photos', { fid, data: d.photos[fid] });
+      }
+    }
+  } catch (e) { /* offline: try again later */ }
+}
+async function prefetchPhotos() {
+  if (photoBusy || !PIN || !photosWanted()) return;
+  photoBusy = true;
+  try {
+    photoKeys = new Set((await Store.keys('photos')) || []);
+    const need = [...new Set([...people.values()].map(p => p.fid).filter(f => f && !photoKeys.has(f)))];
+    photoTotal = photoKeys.size + need.length;
+    for (let i = 0; i < need.length && PIN && photosWanted();) {
+      if (!netOk || isBusy) { await sleep(3000); continue; }
+      await fetchPhotos(need.slice(i, i + 3));
+      i += 3;
+      await sleep(500);
+    }
+  } finally { photoBusy = false; }
+}
+async function showPhotoInto(imgId, fid) {
+  const el = () => $(imgId);
+  const put = d => { const e = el(); if (e && d) { e.src = d; e.style.display = 'block'; } };
+  let d = await getPhoto(fid);
+  if (d) return put(d);
+  if (!netOk) return;
+  await fetchPhotos([fid]);
+  put(await getPhoto(fid));
+}
 
-  if (r.error) {
-    content.innerHTML = '<div class="banner warn">' + esc(r.error) + '</div>';
-    beep(false);
-    autoHide(3500);
+/* ---------- outbox: scans waiting for the server ---------- */
+let flushing = false, nextFlushAt = 0, flushFails = 0, lastScanAt = 0;
+function enqueueScan(p, kind, local, localTime) {
+  const item = { cid: newCid(), id: p.id, k: p.k, kind, ts: Date.now(), pin: PIN, en: kind === 'EVENT' ? evNorm : '', local, localTime };
+  outbox.push(item);
+  Store.put('outbox', item);
+  lastScanAt = Date.now();
+  updateChip();
+  setTimeout(flushOutbox, 30);
+}
+function removeFromOutbox(cid) {
+  outbox = outbox.filter(x => x.cid !== cid);
+  Store.del('outbox', cid);
+}
+function addConflict(msg) {
+  meta.conflicts.unshift({ t: fmtTime(), msg });
+  if (meta.conflicts.length > 30) meta.conflicts.length = 30;
+  saveMeta();
+  toast(msg, 9000);
+  beep(false);
+}
+/** Compare what the server decided with what this phone showed; the server always wins. */
+function reconcile(item, r) {
+  const p = people.get(item.k);
+  const who = p ? p.name + ' (' + p.id + ')' : item.id;
+  if (item.kind === 'ENTRY') {
+    if (r.status === 'OK' || r.status === 'DUPLICATE') {
+      const mine = peekMark(item.k);
+      setEntry(item.k, r.time || (mine && mine.entry) || item.localTime);
+      if (item.local === 'OK' && r.status === 'DUPLICATE') addConflict('⚠ ' + who + ' was already admitted at ' + r.time + ' on another device.');
+    } else if (r.status === 'NOT_FOUND' && item.local === 'OK') {
+      setEntry(item.k, '');
+      addConflict('⚠ ' + who + ': ID not found on the server. Entry cancelled.');
+    }
     return;
   }
-
-  let bannerClass = 'bad';
-  let heading = '';
-  let sub = '';
-
-  if (r.status === 'OK') {
-    bannerClass = 'ok';
-    heading = '✔ ' + esc(r.headline || (r.event + ' GRANTED'));
-    sub = 'Recorded at ' + esc(r.time || 'now');
-    beep(true);
-    // Snappy auto-hide in turbo mode
-    autoHide(turboMode ? 1200 : 2500);
-  } else if (r.status === 'DUPLICATE') {
-    heading = '✖ ' + esc(r.headline || 'ALREADY SCANNED');
-    sub = esc(r.event || 'Entry') + ' first at <b>' + esc(r.time) + '</b>';
-    beep(false);
-    autoHide(turboMode ? 1800 : 3800);
+  learnEvent(r.event);
+  const en = item.en || evNorm;
+  if (r.status === 'OK' || r.status === 'DUPLICATE') {
+    applyRecord(item.k, r.record);
+    setEvent(item.k, en, r.time || item.localTime);
+    if (r.status === 'OK' && r.headline) { meta.okHeadline[en] = r.headline; saveMeta(); }
+    if (item.local === 'OK' && r.status === 'DUPLICATE') addConflict('⚠ ' + who + ' already got ' + (r.event || LABEL) + ' at ' + r.time + ' on another device.');
   } else if (r.status === 'NOT_VERIFIED') {
-    bannerClass = 'warn';
-    heading = '⚠ PAYMENT UNCONFIRMED';
-    sub = esc(r.message || 'Fee verification pending');
-    beep(false);
-    autoHide(4000);
-  } else if (r.status === 'NOT_FOUND') {
-    heading = '✖ ID NOT FOUND';
-    sub = esc(r.message || 'Record not in registered database');
-    beep(false);
-    autoHide(3500);
-  } else if (r.status === 'BAD_PIN') {
-    heading = '✖ INVALID PIN';
-    sub = esc(r.message);
-    beep(false);
-    setTimeout(() => {
-      stopCamera();
-      PIN = '';
-      sheet.classList.remove('show');
-      $('login').style.display = 'flex';
-      $('loginMsg').textContent = r.message;
-    }, 600);
-    return;
-  } else {
-    heading = '✖ SCAN ERROR';
-    sub = esc(r.message || '');
-    beep(false);
-    autoHide(3000);
+    if (p) { p.pv = 0; savePerson(p); }
+    if (item.local === 'OK') { setEvent(item.k, en, ''); addConflict('⚠ ' + who + ': PAYMENT NOT VERIFIED. Do not serve.'); }
+  } else if (r.status === 'NOT_FOUND' && item.local === 'OK') {
+    setEvent(item.k, en, '');
+    addConflict('⚠ ' + who + ': ID not found on the server.');
   }
-
-  let html = '<div class="banner ' + bannerClass + '">' + heading + '<small>' + sub + '</small></div>';
-
-  if (r.guestType !== undefined) {
-    html += '<div class="badge-info-box">' +
-      'Guest: <b>' + esc(r.guestType || '-') + '</b><br>' +
-      'Fee: <b>' + esc(r.totalFee || '0') + ' BDT</b><br>' +
-      'Attendees: <b>' + esc(r.attendees || '1') + ' person(s)</b>' +
-      '</div>';
-  }
-
-  if (r.photo) {
-    html += '<div class="attendee-card"><img src="' + esc(r.photo) + '" alt="Attendee Photo"></div>';
-  }
-
-  if (r.person) {
-    html += '<div class="attendee-card">' +
-      '<div class="name">' + esc(r.person.name) + '</div>' +
-      '<div class="meta">' + esc(r.person.id) +
-      (r.person.degree ? ' · ' + esc(r.person.degree) : '') +
-      (r.person.membership ? ' · ' + esc(r.person.membership) : '') +
-      '</div></div>';
-  } else if (r.name) {
-    html += '<div class="attendee-card">' +
-      '<div class="name">' + esc(r.name) + '</div>' +
-      '<div class="meta">' + esc(r.id) +
-      (r.degree ? ' · ' + esc(r.degree) : '') +
-      (r.session ? ' (' + esc(r.session) + ')' : '') +
-      (r.bloodGroup ? ' · Blood ' + esc(r.bloodGroup) : '') +
-      '</div></div>';
-  }
-
-  if (r.record && r.record.length) {
-    html += '<div class="record-list">';
-    r.record.forEach(item => {
-      html += '<div class="record-row' + (item.key === r.current ? ' active-row' : '') + '">' +
-        '<span>' + esc(item.label) + '</span>' +
-        (item.time ? '<span class="status-yes">✔ ' + esc(item.time) + '</span>' : '<span class="status-no">— Not yet</span>') +
-        '</div>';
-    });
-    html += '</div>';
-  }
-
-  content.innerHTML = html;
-  sheet.classList.add('show');
+}
+async function flushOutbox() {
+  if (flushing || !PIN) return;
+  if (!outbox.some(x => !x.dead)) return;
+  flushing = true;
+  try {
+    while (outbox.some(x => !x.dead)) {
+      const live = outbox.filter(x => !x.dead);
+      const pin = live[0].pin;
+      const batch = live.filter(x => x.pin === pin).slice(0, 10);
+      let d;
+      try {
+        d = await api('app_sync', { pin, dev: meta.deviceId, scans: batch.map(x => ({ cid: x.cid, id: x.id, kind: x.kind, ts: x.ts })) }, 30000);
+      } catch (e) { setNet(false); flushFails++; nextFlushAt = Date.now() + Math.min(30000, 2000 * Math.pow(2, flushFails - 1)); break; }
+      setNet(true);
+      if (d.bad_pin) {
+        batch.forEach(x => { x.dead = true; Store.put('outbox', x); });
+        if (pin === PIN) forceRelogin(d.message || 'PIN no longer valid');
+        continue;
+      }
+      if (!d.ok || !d.results) { flushFails++; nextFlushAt = Date.now() + Math.min(30000, 2000 * Math.pow(2, flushFails - 1)); break; }
+      let retry = false;
+      d.results.forEach(r => {
+        const item = batch.find(x => x.cid === r.cid);
+        if (!item) return;
+        if (r.status === 'ERROR' || r.status === 'BAD_PIN') { retry = true; return; }   // e.g. "System busy": keep and try again
+        reconcile(item, r);
+        removeFromOutbox(item.cid);
+      });
+      if (retry) { flushFails++; nextFlushAt = Date.now() + 3000; break; }
+      flushFails = 0;
+      if (typeof d.seq === 'number' && d.seq > meta.seq) { /* our own changes come back via delta: harmless */ }
+    }
+  } finally { flushing = false; updateChip(); }
 }
 
+/* ---------- live updates from the other phones ---------- */
+let polling = false, lastPollAt = 0;
+async function pollDelta() {
+  if (polling || !PIN || snapBusy) return;
+  polling = true; lastPollAt = Date.now();
+  try {
+    const d = await api('app_delta', { pin: PIN, since: meta.seq, dev: meta.deviceId }, 12000);
+    setNet(true);
+    if (d.bad_pin) { forceRelogin(d.message || 'PIN no longer valid'); return; }
+    if (!d.ok) return;
+    if (d.reset) { await downloadSnapshot(false); return; }
+    (d.changes || []).forEach(c => {
+      const k = String(c[0]).toLowerCase(), kind = c[1], t = c[2];
+      if (kind === 'ENTRY') { if (!hasPending(k, 'ENTRY')) setEntry(k, t); }
+      else { const en = resolveEv(norm(kind)); if (!hasPending(k, 'EVENT', en)) setEvent(k, en, t); }
+    });
+    meta.seq = d.seq; saveMeta();
+    if (d.more) setTimeout(pollDelta, 50);
+  } catch (e) { setNet(false); }
+  finally { polling = false; }
+}
+
+function startTicker() {
+  setInterval(() => {
+    if (!PIN) return;
+    const now = Date.now();
+    if (outbox.some(x => !x.dead) && now >= nextFlushAt) flushOutbox();
+    const iv = now - lastScanAt < 60000 ? POLL_ACTIVE : POLL_IDLE;
+    if (now - lastPollAt >= iv && !flushing) pollDelta();
+    if (now - meta.snapshotAt > SNAPSHOT_REFRESH && !snapBusy && netOk && !outbox.length) downloadSnapshot(false).catch(() => {});
+    updateChip();
+  }, 1000);
+  window.addEventListener('online', () => { nextFlushAt = 0; flushFails = 0; flushOutbox(); pollDelta(); });
+  window.addEventListener('offline', () => setNet(false));
+}
+
+/* ---------- scanning: decide instantly from the local copy ---------- */
+function buildRecord(k) {
+  const m = peekMark(k) || { entry: '', ev: {} };
+  const rows = [{ label: 'Gate Entry', time: m.entry, cur: ROLE === 'gate' }];
+  meta.events.forEach(e => rows.push({ label: e.label, time: m.ev[e.norm] || '', cur: ROLE === 'event' && e.norm === evNorm }));
+  Object.keys(m.ev).forEach(n => { if (!meta.events.some(e => e.norm === n)) rows.push({ label: n, time: m.ev[n], cur: n === evNorm }); });
+  return rows;
+}
+function vmGate(p, status, time) {
+  return status === 'OK'
+    ? { status: 'OK', headline: '✔ VALID - ENTRY ALLOWED', sub: 'Marked as entered at ' + esc(time), person: p, rec: false }
+    : { status: 'DUPLICATE', headline: '✖ ALREADY SCANNED', sub: 'DO NOT ALLOW ENTRY · first scanned <b>' + esc(time) + '</b>', person: p, rec: false };
+}
+function vmEvent(p, status, time, headline) {
+  const name = LABEL || 'Event';
+  return status === 'OK'
+    ? { status: 'OK', headline: '✔ ' + (headline || meta.okHeadline[evNorm] || (name.toUpperCase() + ' GIVEN')), sub: 'Recorded at ' + esc(time), person: p, rec: true }
+    : { status: 'DUPLICATE', headline: '✖ ALREADY SCANNED', sub: esc(name) + ' was given at <b>' + esc(time) + '</b>', person: p, rec: true };
+}
+
+async function submitScan(rawText) {
+  if (!PIN || isBusy) return;
+  const id = extractId(rawText);
+  if (!id) return;
+  const k = id.toLowerCase();
+  const p = people.get(k);
+  // Not in the local list, or an event scan we cannot judge locally -> ask the server (authoritative)
+  if (!p || (ROLE === 'event' && (p.pv === 0 || !evNorm))) return serverCheck(id, k, p);
+  if (ROLE === 'gate') localGate(p); else localEvent(p);
+}
+function localGate(p) {
+  const m = peekMark(p.k);
+  if (m && m.entry) { enqueueScan(p, 'ENTRY', 'DUPLICATE', m.entry); showResult(vmGate(p, 'DUPLICATE', m.entry)); return; }
+  const t = fmtTime();
+  setEntry(p.k, t);
+  enqueueScan(p, 'ENTRY', 'OK', t);
+  showResult(vmGate(p, 'OK', t));
+}
+function localEvent(p) {
+  const m = peekMark(p.k), prev = m && m.ev[evNorm];
+  if (prev) { enqueueScan(p, 'EVENT', 'DUPLICATE', prev); showResult(vmEvent(p, 'DUPLICATE', prev)); return; }
+  const t = fmtEvTime();
+  setEvent(p.k, evNorm, t);
+  enqueueScan(p, 'EVENT', 'OK', t);
+  showResult(vmEvent(p, 'OK', t));
+}
+
+async function serverCheck(id, k, p) {
+  isBusy = true;
+  const kind = ROLE === 'gate' ? 'ENTRY' : 'EVENT';
+  render({ status: 'PENDING', headline: 'Checking ' + id + '…', sub: p ? 'Verifying with the server' : 'Not in the local list yet' });
+  try {
+    const d = await api('app_sync', { pin: PIN, dev: meta.deviceId, wantPerson: true, scans: [{ cid: newCid(), id, kind, ts: Date.now() }] }, 9000);
+    setNet(true);
+    if (d.bad_pin) { forceRelogin(d.message || 'PIN no longer valid'); return; }
+    if (!d.ok || !d.results || !d.results[0]) throw new Error(d.message || 'Server error');
+    const r = d.results[0];
+    if (r.person) { p = rowToPerson(r.person); people.set(p.k, p); savePerson(p); }
+    if (kind === 'EVENT') learnEvent(r.event);
+    let vm;
+    if (r.status === 'OK' || r.status === 'DUPLICATE') {
+      if (p) { p.pv = 1; savePerson(p); }
+      if (kind === 'ENTRY') setEntry(p ? p.k : k, r.time);
+      else { applyRecord(p ? p.k : k, r.record); setEvent(p ? p.k : k, evNorm, r.time); if (r.status === 'OK' && r.headline) { meta.okHeadline[evNorm] = r.headline; saveMeta(); } }
+      vm = kind === 'ENTRY' ? vmGate(p, r.status, r.time) : vmEvent(p, r.status, r.time, r.headline);
+    } else if (r.status === 'NOT_VERIFIED') {
+      if (p) { p.pv = 0; savePerson(p); }
+      vm = { status: 'NOT_VERIFIED', headline: '⚠ PAYMENT NOT VERIFIED', sub: 'Do not serve - send to the help desk', person: p, rec: kind === 'EVENT' };
+    } else if (r.status === 'NOT_FOUND') {
+      vm = { status: 'NOT_FOUND', headline: '✖ INVALID SLIP', sub: esc(r.message || ('ID ' + id + ' not found')) };
+    } else {
+      vm = { status: 'ERROR', headline: '✖ SCAN ERROR', sub: esc(r.message || '') };
+    }
+    showResult(vm);
+  } catch (err) {
+    setNet(false);
+    showResult(p
+      ? { status: 'WARN', headline: '⚠ CANNOT VERIFY (OFFLINE)', sub: 'Payment status unknown - send to the help desk', person: p, rec: false }
+      : { status: 'WARN', headline: '⚠ ID NOT IN THIS PHONE\'S LIST', sub: 'Connect to the internet and scan again' });
+  } finally { isBusy = false; }
+}
+
+/* ---------- result sheet ---------- */
+let renderToken = 0;
+function render(vm) {
+  const token = ++renderToken;
+  const cls = { OK: 'ok', DUPLICATE: 'bad', NOT_FOUND: 'bad' }[vm.status] || 'warn';
+  let html = '<div class="banner ' + cls + '">' + esc(vm.headline) + (vm.sub ? '<small>' + vm.sub + '</small>' : '') + '</div>';
+  const p = vm.person;
+  if (p) {
+    if (ROLE === 'gate') {
+      html += '<div class="badge-info-box">Guest type: <b>' + esc(p.guestType || '-') + '</b><br>' +
+        'Total paid: <b>' + esc(p.totalFee || '0') + ' BDT</b><br>Attendees: <b>' + esc(p.attendees || '-') + '</b></div>';
+    }
+    if (vm.rec) {
+      html += '<div class="record-list">';
+      buildRecord(p.k).forEach(it => {
+        html += '<div class="record-row' + (it.cur ? ' active-row' : '') + '"><span>' + esc(it.label) + '</span>' +
+          (it.time ? '<span class="status-yes">✔ ' + esc(it.time) + '</span>' : '<span class="status-no">— Not yet</span>') + '</div>';
+      });
+      html += '</div>';
+    }
+    html += '<div class="attendee-card">' + (p.fid ? '<img id="resPhoto" alt="" style="display:none">' : '') +
+      '<div class="name">' + esc(p.name) + '</div><div class="meta">' + esc(p.id) +
+      (ROLE === 'gate'
+        ? (p.degree ? ' · ' + esc(p.degree) : '') + (p.session ? ' (' + esc(p.session) + ')' : '') + (p.bloodGroup ? ' · Blood ' + esc(p.bloodGroup) : '')
+        : (p.attendees ? ' · ' + esc(p.attendees) + ' attendee(s)' : '')) +
+      '</div></div>';
+  }
+  $('resultContent').innerHTML = html;
+  $('result').classList.add('show');
+  if (p && p.fid && token === renderToken) showPhotoInto('resPhoto', p.fid);
+}
+function showResult(vm) {
+  render(vm);
+  if (vm.status === 'OK') { beep(true); autoHide(turboMode ? 1400 : 2500); }
+  else if (vm.status === 'DUPLICATE') { beep(false); autoHide(turboMode ? 2200 : 3800); }
+  else { beep(false); autoHide(3800); }
+}
 let hideTimer = null;
 function autoHide(ms) {
   clearTimeout(hideTimer);
-  hideTimer = setTimeout(() => {
-    $('result').classList.remove('show');
-  }, ms);
+  hideTimer = setTimeout(() => { $('result').classList.remove('show'); }, ms);
+}
+let toastTimer = null;
+function toast(msg, ms) {
+  const t = $('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), ms || 5000);
 }
 
-// Manual Input Dialog
-$('manualBtn').onclick = () => {
-  const entered = prompt('Enter Registration ID manually:');
-  if (entered && entered.trim()) {
-    submitScan(entered.trim());
+/* ---------- sync indicator + panel ---------- */
+function updateChip() {
+  const el = $('syncChip'); if (!el) return;
+  const pend = outbox.filter(x => !x.dead).length;
+  const online = netOk && navigator.onLine !== false;
+  let txt, cls;
+  if (!online) { txt = '○ Offline' + (pend ? ' · ' + pend + ' saved' : ''); cls = 'off'; }
+  else if (pend) { txt = '↑ Syncing ' + pend; cls = 'pend'; }
+  else { txt = '● Live'; cls = 'live'; }
+  el.textContent = txt; el.className = 'sync-chip ' + cls;
+}
+function openPanel() {
+  const pend = outbox.filter(x => !x.dead).length, dead = outbox.filter(x => x.dead).length;
+  const ago = meta.lastContact ? Math.max(0, Math.round((Date.now() - meta.lastContact) / 1000)) + ' s ago' : 'never';
+  let h = '<h2>Sync status</h2><div class="panel-grid">' +
+    '<div>Scanner</div><b>' + esc(ROLE === 'gate' ? 'ENTRY GATE' : (LABEL || 'Event')) + '</b>' +
+    '<div>Registrations on this phone</div><b>' + people.size + '</b>' +
+    '<div>Waiting to upload</div><b>' + pend + (dead ? ' (+' + dead + ' need re-login)' : '') + '</b>' +
+    '<div>Last server contact</div><b>' + esc(ago) + '</b>' +
+    '<div>Photos saved</div><b>' + photoKeys.size + ' / ' + photoTotal + (photosWanted() ? '' : ' (off)') + '</b></div>';
+  if (meta.conflicts.length) {
+    h += '<div class="panel-sub">Recent conflicts</div><div class="panel-list">' + meta.conflicts.slice(0, 8).map(c => '<div><small>' + esc(c.t) + '</small><br>' + esc(c.msg) + '</div>').join('') + '</div>';
   }
-};
-
-// Grant Permission Actions
-$('grantPermBtn').onclick = async () => {
-  $('permModal').style.display = 'none';
-  await startCamera();
-};
-
-$('openSettingsBtn').onclick = async () => {
-  if (isNative && BarcodeScanner) {
-    try {
-      await BarcodeScanner.openSettings();
-      return;
-    } catch (e) {
-      console.warn('BarcodeScanner.openSettings failed:', e);
-    }
-  }
-  alert('On your Android device:\n1. Open Settings -> Apps -> DUAAPS Scanner\n2. Tap "Permissions"\n3. Tap "Camera"\n4. Select "Allow only while using the app"');
-};
-
-const closeBtn = $('closePermBtn');
-if (closeBtn) {
-  closeBtn.onclick = () => {
-    $('permModal').style.display = 'none';
-  };
+  $('panelBody').innerHTML = h;
+  $('photoToggle').textContent = photosWanted() ? 'Photo download: ON' : 'Photo download: OFF';
+  $('syncPanel').style.display = 'flex';
 }
 
-// PIN Unlock Flow
+/* ---------- login / session ---------- */
+function forceRelogin(msg) {
+  stopCamera();
+  PIN = ''; ROLE = '';
+  try { localStorage.removeItem('duaaps_scan_pin'); } catch (e) {}
+  $('result').classList.remove('show');
+  $('login').style.display = 'flex';
+  $('loginMsg').textContent = msg || '';
+  updateChip();
+}
+function startSession(pin, role, label) {
+  PIN = pin; ROLE = role; LABEL = label || '';
+  if (role === 'event') {
+    let saved = ''; try { saved = localStorage.getItem('duaaps_evnorm') || ''; } catch (e) {}
+    evNorm = resolveEv(norm(LABEL)) || saved;
+  } else evNorm = '';
+  try {
+    localStorage.setItem('duaaps_scan_pin', pin);
+    localStorage.setItem('duaaps_role', role);
+    localStorage.setItem('duaaps_label', LABEL);
+    if (evNorm) localStorage.setItem('duaaps_evnorm', evNorm);
+  } catch (e) {}
+  EVT = role === 'gate' ? 'ENTRY GATE' : (LABEL || 'EVENT');
+  $('evName').textContent = EVT.toUpperCase();
+  $('login').style.display = 'none';
+  wantScanning = true;
+  lastPollAt = 0; nextFlushAt = 0;
+  setTimeout(startCamera, 100);
+  updateChip();
+  flushOutbox();
+  prefetchPhotos();
+}
+
 $('loginBtn').onclick = doLogin;
 $('pin').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
 
@@ -539,68 +902,123 @@ async function doLogin() {
   if (!p) return;
   $('loginBtn').disabled = true;
   $('loginMsg').textContent = 'Authenticating PIN…';
-
   try {
-    const res = await fetch(WEBAPP_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ action: 'login', pin: p })
-    });
-    const raw = await res.text();
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch (e) {
-      $('loginMsg').textContent = 'Server returned an unexpected response. Check the Apps Script deployment (Execute as: Me, Access: Anyone).';
-      $('loginBtn').disabled = false;
-      return;
+    const d = await api('app_login', { pin: p, dev: meta.deviceId }, 20000);
+    if (d.ok === undefined) { $('loginMsg').textContent = 'The server is not updated yet: add AppApi.gs and the one-line route in doPost (see apps-script/SETUP.md).'; return; }
+    if (!d.ok) { $('loginMsg').textContent = d.message || 'Incorrect PIN'; return; }
+    setNet(true);
+    applyTz(d);
+    if (people.size === 0 || Date.now() - meta.snapshotAt > 30 * 60 * 1000) {
+      $('loginMsg').textContent = 'Downloading registrations…';
+      try { await downloadSnapshot(true, p); }
+      catch (e) {
+        if (people.size === 0) { $('loginMsg').textContent = 'Could not download the list (' + e.message + '). Every scan will be checked on the server instead.'; await sleep(1800); }
+      }
     }
-
-    if (!data.ok) {
-      $('loginMsg').textContent = data.message || 'Incorrect Event PIN';
-      $('loginBtn').disabled = false;
-      return;
-    }
-    PIN = p;
-    EVT = data.label || 'ANNUAL REUNION';
-    $('pin').value = '';
-    $('loginMsg').textContent = '';
-    $('evName').textContent = EVT.toUpperCase();
-    $('login').style.display = 'none';
-    try { localStorage.setItem('duaaps_scan_pin', PIN); } catch (e) {}
-    wantScanning = true;
-    setTimeout(startCamera, 100);
+    $('pin').value = ''; $('loginMsg').textContent = '';
+    startSession(p, d.role, d.label);
   } catch (err) {
-    $('loginMsg').textContent = 'Network error: ' + (err.message || err) + '. Check your internet connection.';
-  }
-  $('loginBtn').disabled = false;
+    // Offline unlock: same PIN as last time and the list is already on this phone
+    let sp = '', sr = '', sl = '';
+    try { sp = localStorage.getItem('duaaps_scan_pin') || ''; sr = localStorage.getItem('duaaps_role') || ''; sl = localStorage.getItem('duaaps_label') || ''; } catch (e) {}
+    if (err.name !== 'BadResponse' && people.size > 0 && sp === p && sr) { $('pin').value = ''; $('loginMsg').textContent = ''; setNet(false); startSession(p, sr, sl); }
+    else $('loginMsg').textContent = err.name === 'AbortError' ? 'Timed out. Check the internet connection.' : (err.name === 'BadResponse' ? err.message : 'Network error: ' + (err.message || err) + '. Check the internet connection.');
+  } finally { $('loginBtn').disabled = false; }
 }
 
 $('changeBtn').onclick = () => {
   stopCamera();
-  PIN = '';
+  PIN = ''; ROLE = '';
   try { localStorage.removeItem('duaaps_scan_pin'); } catch (e) {}
   $('result').classList.remove('show');
   $('login').style.display = 'flex';
   $('pin').focus();
+  updateChip();
 };
 
-// App launch: ask for camera permission right away (independent of login, so a slow or failing
-// server can never hide the permission prompt), then auto-login with the saved PIN.
-window.addEventListener('DOMContentLoaded', () => {
-  ensureCameraPermission();
+/* ---------- misc buttons ---------- */
+$('manualBtn').onclick = () => {
+  const entered = prompt('Enter Registration ID manually:');
+  if (entered && entered.trim()) submitScan(entered.trim());
+};
+$('grantPermBtn').onclick = async () => { $('permModal').style.display = 'none'; await startCamera(); };
+$('openSettingsBtn').onclick = async () => {
+  if (isNative && BarcodeScanner) {
+    try { await BarcodeScanner.openSettings(); return; } catch (e) { console.warn('openSettings failed:', e); }
+  }
+  alert('On your Android device:\n1. Open Settings -> Apps -> DUAAPS Scanner\n2. Tap "Permissions"\n3. Tap "Camera"\n4. Select "Allow only while using the app"');
+};
+$('closePermBtn').onclick = () => { $('permModal').style.display = 'none'; };
+
+$('syncChip').onclick = openPanel;
+$('closePanelBtn').onclick = () => { $('syncPanel').style.display = 'none'; };
+$('syncNowBtn').onclick = async () => { nextFlushAt = 0; flushFails = 0; await flushOutbox(); await pollDelta(); openPanel(); };
+$('redownloadBtn').onclick = async () => {
+  $('panelBody').innerHTML = '<h2>Downloading…</h2>';
+  try { await downloadSnapshot(false); } catch (e) { toast('Download failed: ' + e.message, 5000); }
+  openPanel();
+};
+$('photoToggle').onclick = () => {
+  try { localStorage.setItem('duaaps_photos', photosWanted() ? 'off' : 'on'); } catch (e) {}
+  if (photosWanted()) prefetchPhotos();
+  openPanel();
+};
+
+/* ---------- zoom (like the built-in scanner: pinch, or tap the 1x button) ---------- */
+let zoomMin = 1, zoomMax = 1, zoomNow = 1, zoomBusy = false;
+async function initZoom() {
   try {
-    const saved = localStorage.getItem('duaaps_scan_pin');
-    if (saved) {
-      $('pin').value = saved;
-      doLogin();
-    }
-  } catch (e) {}
+    zoomMin = (await BarcodeScanner.getMinZoomRatio()).zoomRatio || 1;
+    zoomMax = (await BarcodeScanner.getMaxZoomRatio()).zoomRatio || 1;
+  } catch (e) { zoomMin = zoomMax = 1; }
+  zoomNow = zoomMin;
+  $('zoomBtn').style.display = zoomMax > zoomMin + 0.05 ? 'block' : 'none';
+  let saved = 0; try { saved = parseFloat(localStorage.getItem('duaaps_zoom')) || 0; } catch (e) {}
+  if (saved > zoomMin + 0.05) await setZoom(saved); else updateZoomLabel();
+}
+function updateZoomLabel() { $('zoomBtn').textContent = (Math.round(zoomNow * 10) / 10) + '×'; }
+async function setZoom(z) {
+  z = Math.max(zoomMin, Math.min(zoomMax, z));
+  if (zoomBusy || !nativeScanning) return;
+  zoomBusy = true;
+  try { await BarcodeScanner.setZoomRatio({ zoomRatio: z }); zoomNow = z; updateZoomLabel(); try { localStorage.setItem('duaaps_zoom', String(z)); } catch (e) {} }
+  catch (e) { /* ignore */ }
+  zoomBusy = false;
+}
+$('zoomBtn').onclick = () => {
+  const steps = [zoomMin, 2, 3, 4].filter((s, i) => i === 0 || s <= zoomMax);
+  const next = steps.find(s => s > zoomNow + 0.15);
+  setZoom(next !== undefined ? next : steps[0]);
+};
+let pinchStart = 0, pinchZoom0 = 1;
+const touchDist = e => Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+document.addEventListener('touchstart', e => { if (e.touches.length === 2) { pinchStart = touchDist(e); pinchZoom0 = zoomNow; } }, { passive: true });
+document.addEventListener('touchmove', e => { if (e.touches.length === 2 && pinchStart) setZoom(pinchZoom0 * touchDist(e) / pinchStart); }, { passive: true });
+document.addEventListener('touchend', e => { if (e.touches.length < 2) pinchStart = 0; }, { passive: true });
+
+/* ---------- start-up ---------- */
+window.addEventListener('DOMContentLoaded', async () => {
+  await loadLocal();
+  ensureCameraPermission();      // asked once, at launch, independent of login
+  startTicker();
+  updateChip();
+  let sp = '', sr = '', sl = '';
+  try { sp = localStorage.getItem('duaaps_scan_pin') || ''; sr = localStorage.getItem('duaaps_role') || ''; sl = localStorage.getItem('duaaps_label') || ''; } catch (e) {}
+  if (sp && sr && people.size > 0) {
+    startSession(sp, sr, sl);    // works offline: the list is already on the phone
+    api('app_login', { pin: sp, dev: meta.deviceId }, 15000).then(d => {
+      setNet(true);
+      if (d.bad_pin) forceRelogin(d.message || 'PIN no longer valid');
+      else if (d.ok) { applyTz(d); if (d.label && !LABEL) { LABEL = d.label; } }
+    }).catch(() => setNet(false));
+  } else if (sp) { $('pin').value = sp; doLogin(); }
 });
 
-// Coming back from Android Settings / another app: retry the camera automatically
+// Coming back from Android Settings / another app: retry the camera, sync straight away
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible' || !PIN || !wantScanning) return;
+  if (document.visibilityState !== 'visible' || !PIN) return;
+  nextFlushAt = 0; flushOutbox(); pollDelta();
+  if (!wantScanning) return;
   const modal = $('permModal');
   const modalOpen = modal && modal.style.display === 'flex';
   if (modalOpen || !nativeScanning) startCamera();

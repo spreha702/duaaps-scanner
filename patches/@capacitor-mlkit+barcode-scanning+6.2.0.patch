@@ -1,0 +1,24 @@
+diff --git a/node_modules/@capacitor-mlkit/barcode-scanning/android/src/main/java/io/capawesome/capacitorjs/plugins/mlkit/barcodescanning/BarcodeScanner.java b/node_modules/@capacitor-mlkit/barcode-scanning/android/src/main/java/io/capawesome/capacitorjs/plugins/mlkit/barcodescanning/BarcodeScanner.java
+index d4d4d1d..a7e05f6 100644
+--- a/node_modules/@capacitor-mlkit/barcode-scanning/android/src/main/java/io/capawesome/capacitorjs/plugins/mlkit/barcodescanning/BarcodeScanner.java
++++ b/node_modules/@capacitor-mlkit/barcode-scanning/android/src/main/java/io/capawesome/capacitorjs/plugins/mlkit/barcodescanning/BarcodeScanner.java
+@@ -12,6 +12,7 @@ import android.graphics.Point;
+ import android.media.Image;
+ import android.net.Uri;
+ import android.provider.Settings;
++import android.util.Size;
+ import android.view.Display;
+ import android.view.WindowManager;
+ import androidx.annotation.NonNull;
+@@ -96,7 +97,10 @@ public class BarcodeScanner implements ImageAnalysis.Analyzer {
+         BarcodeScannerOptions options = buildBarcodeScannerOptions(scanSettings);
+         barcodeScannerInstance = BarcodeScanning.getClient(options);
+ 
+-        ImageAnalysis imageAnalysis = new ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build();
++        ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
++            .setTargetResolution(new Size(1080, 1920))
++            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
++            .build();
+         imageAnalysis.setAnalyzer(ContextCompat.getMainExecutor(plugin.getContext()), this);
+ 
+         ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(plugin.getContext());

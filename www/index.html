@@ -46,6 +46,22 @@
   <!-- Live Status & Helper Chip -->
   <div class="hint-pill" id="camMsg">Point camera at QR code</div>
   <button class="chip-btn" id="manualBtn">Type ID</button>
+  <button class="chip-btn zoom-btn" id="zoomBtn" style="display:none">1×</button>
+
+  <!-- Live sync status (tap for details) -->
+  <button class="sync-chip live" id="syncChip">● Live</button>
+  <div id="toast" class="toast"></div>
+
+  <!-- Sync details panel -->
+  <div id="syncPanel" class="modal-backdrop" style="display:none">
+    <div class="modal-card">
+      <div id="panelBody"></div>
+      <button id="syncNowBtn" class="primary-btn">Sync now</button>
+      <button id="redownloadBtn" class="secondary-btn" style="margin-top:8px">Re-download all data</button>
+      <button id="photoToggle" class="secondary-btn" style="margin-top:8px">Photo download: ON</button>
+      <button id="closePanelBtn" class="secondary-btn" style="margin-top:8px;background:transparent;color:#94a3b8">Close</button>
+    </div>
+  </div>
 
   <!-- Sliding Result Sheet -->
   <div id="result" class="result-sheet">
@@ -88,7 +104,7 @@
         </svg>
       </div>
       <h2>DUAAPS Scanner</h2>
-      <p class="subtitle">Enter Event PIN to unlock. (Saved automatically for future launches)</p>
+      <p class="subtitle">Enter your PIN (Gate PIN or Event PIN). The registration list is downloaded once, then the app works even with a weak connection.</p>
       <input id="pin" type="password" inputmode="numeric" placeholder="••••" maxlength="6" autocomplete="off">
       <button id="loginBtn" class="primary-btn">Unlock Scanner</button>
       <div class="login-msg" id="loginMsg"></div>
